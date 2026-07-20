@@ -213,12 +213,14 @@ async fn main(spawner: Spawner) {
     )
     .await;
 
-    // No full refresh, not even at the start. The full waveform on this panel
-    // does not complete -- it runs past its budget and leaves BUSY asserted,
-    // and every partial after it then inherits a busy controller and stalls.
-    // Starting straight into partials keeps BUSY clean, and the ghosting the
-    // clear would have removed is wanted anyway.
-    crate::log!("panel: init done, busy={}, starting audio", epd::busy_level() as u8);
+    // One full refresh at boot, to start the demo from a clean page. This is
+    // the only full waveform the firmware ever runs: during playback the
+    // ghosting is wanted, and a full refresh mid-video would cost a dozen
+    // frames. It also resyncs the partial engine's shadow to white -- without
+    // that the first frames diff as unchanged and the panel stays blank.
+    crate::log!("panel: init done, busy={}, clearing", epd::busy_level() as u8);
+    panel.clear_white().await;
+    crate::log!("panel: cleared, busy={}, starting", epd::busy_level() as u8);
     led_blue.set_high();
 
     spawner.must_spawn(heartbeat_task());
@@ -339,9 +341,6 @@ async fn play(
             crate::log!("LUT speed -> {}", LUT_SPEEDS[speed_idx]);
         }
         fire_was = fire_now;
-        if audio::finished() {
-            return Stop::AudioEnded;
-        }
 
         // Whichever frame the music has reached.
         //
@@ -364,9 +363,10 @@ async fn play(
             0
         };
 
-        if target >= header.frame_count {
-            return Stop::Complete;
-        }
+        // The audio clock restarts at zero when the track loops, so `target`
+        // simply wraps with it. Clamp anyway: a sample count slightly beyond
+        // the video's own length would otherwise index past the last frame.
+        let target = target.min(header.frame_count - 1);
 
         if shown == Some(target) {
             // Ahead of the music: wait instead of redrawing the same frame,
@@ -421,7 +421,12 @@ async fn play(
         }
         led_blue.toggle();
 
-        defmt::info!("frame {} ({} skipped)", target, skipped);
+        defmt::info!(
+            "frame {} (pass {}, {} skipped)",
+            target,
+            audio::loops() + 1,
+            skipped
+        );
         // One line per shown frame: index, coded size, how long the panel
         // actually took, and whether the backstop fired. This is the record
         // that says whether the panel or the clock is the thing going wrong.

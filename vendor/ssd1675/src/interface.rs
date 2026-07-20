@@ -150,7 +150,7 @@ where
 /// Longest wait for BUSY to rise after a refresh is triggered.
 const BUSY_ASSERT_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(500);
 /// Longest wait for an in-flight refresh to finish.
-const BUSY_CLEAR_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(12);
+const BUSY_CLEAR_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(30);
 
 impl<SpiDev, BUSY, DC, RESET> DisplayInterface for Interface<SpiDev, BUSY, DC, RESET>
 where

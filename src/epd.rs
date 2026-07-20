@@ -590,23 +590,41 @@ impl Panel {
     /// the inversion phases in the raw OTP waveform are what actually clear
     /// accumulated ghosting from the non-flashing frame path.
     pub async fn clear_white(&mut self) {
+        let t0 = embassy_time::Instant::now();
         self.gfx.clear(Color::White);
         if self.gfx.reset().await.is_err() {
             defmt::error!("EPD reset before clear failed");
             crate::log!("EPD reset before clear failed");
         }
-        // OEM timing (the variant default) — a full refresh is a one-off at
-        // start/end, so there is nothing to gain by rushing it.
-        let speed = self.variant.default_lut_speed();
+        // Rush it a little. At OEM timing this panel's full waveform measures
+        // ~22 s, which is a long time to stare at a flashing screen before
+        // the demo starts; a third of that still erases cleanly because a
+        // full refresh drives every pixel through the inversion phases
+        // regardless.
+        let speed = 30;
         if self.gfx.update_tc(speed).await.is_err() {
             defmt::error!("EPD clear-to-white failed");
             crate::log!("EPD clear-to-white failed");
         }
+
+        // Tell the partial engine the panel is now white. Without this its
+        // shadow still holds whatever it last drove, so the first frames
+        // afterwards diff as unchanged and come back NoOp -- the panel stays
+        // blank while the player believes it is drawing.
+        self.partial.clear_to(Color::White);
+        self.partial.clear_all_dirty();
+
+        defmt::info!(
+            "clear_white took {} ms (busy {})",
+            t0.elapsed().as_millis(),
+            busy_level() as u8
+        );
     }
 
     /// Put the controller into deep sleep (RAM preserved).  Any later
     /// refresh must be preceded by a reset, so treat this as terminal for
     /// the playback session.
+    #[allow(dead_code)]
     pub async fn sleep(&mut self) {
         let display: &mut Display<'static, _> = &mut self.gfx;
         if display.deep_sleep().await.is_err() {

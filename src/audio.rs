@@ -74,6 +74,14 @@ static SAMPLES_PLAYED: AtomicU32 = AtomicU32::new(0);
 /// Set once the audio stream has run out.
 static FINISHED: AtomicBool = AtomicBool::new(false);
 
+/// How many times the track has restarted.
+static LOOPS: AtomicU32 = AtomicU32::new(0);
+
+/// Number of completed passes through the track.
+pub fn loops() -> u32 {
+    LOOPS.load(Ordering::Relaxed)
+}
+
 /// How many samples have been queued for playback so far.
 ///
 /// This lags what has physically left the pin by up to one buffer (~85 ms),
@@ -84,6 +92,10 @@ pub fn samples_played() -> u32 {
 }
 
 /// Whether the audio stream has been played to the end.
+///
+/// Unused while the track loops forever, but kept: it is the only signal a
+/// caller has that playback ended.
+#[allow(dead_code)]
 pub fn finished() -> bool {
     FINISHED.load(Ordering::Relaxed)
 }
@@ -160,6 +172,14 @@ impl<R: AssetRead> Stream<R> {
         self.cursor = 0;
         self.next_block += 1;
         self.valid > 0
+    }
+
+    /// Rewind to the first block. Used to loop the track.
+    fn rewind(&mut self) {
+        self.next_block = 0;
+        self.cursor = 0;
+        self.valid = 0;
+        self.done = false;
     }
 
     /// Next sample, or `None` once the stream is exhausted.
@@ -312,12 +332,25 @@ async fn fill<R: AssetRead>(
     let buf = unsafe { &mut *BUFFERS.words[half].get() };
 
     for slot in buf.iter_mut() {
-        match stream.next().await {
-            Some(sample) => *slot = adpcm::sample_to_duty(sample, top),
+        let sample = match stream.next().await {
+            Some(s) => Some(s),
             None => {
-                *slot = silence;
+                // End of track: start it again and carry straight on, so the
+                // loop has no gap in it. The sample counter restarts too --
+                // it is the video's clock, and resetting it is what makes the
+                // picture wrap back to frame 0 with the music instead of
+                // drifting a little further out on every pass.
+                stream.rewind();
+                SAMPLES_PLAYED.store(0, Ordering::Relaxed);
+                LOOPS.fetch_add(1, Ordering::Relaxed);
+                stream.next().await
             }
-        }
+        };
+        *slot = match sample {
+            Some(s) => adpcm::sample_to_duty(s, top),
+            // Only reachable if the file itself is unreadable.
+            None => silence,
+        };
     }
 
     !stream.done
