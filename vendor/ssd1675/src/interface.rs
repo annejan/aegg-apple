@@ -147,15 +147,9 @@ where
     }
 }
 
-/// How long to wait for BUSY to rise after triggering a refresh.
-///
-/// The controller asserts BUSY within a frame or two of master activation, so
-/// this only ever expires when the waveform drives nothing at all.
+/// Longest wait for BUSY to rise after a refresh is triggered.
 const BUSY_ASSERT_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(500);
-
-/// How long to wait for a refresh already under way to finish. The slowest
-/// full waveform on this panel is ~6 s, so this is a wedged-controller
-/// backstop rather than a normal bound.
+/// Longest wait for an in-flight refresh to finish.
 const BUSY_CLEAR_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(12);
 
 impl<SpiDev, BUSY, DC, RESET> DisplayInterface for Interface<SpiDev, BUSY, DC, RESET>
@@ -192,27 +186,17 @@ where
     }
 
     async fn busy_wait(&mut self) -> Result<(), SpiDev::Error> {
-        // Bounded for the same reason as `busy_wait_for_completion`: a
-        // controller that never lowers BUSY would otherwise wedge the caller
-        // permanently with nothing to show for it. Pressing on risks talking
-        // to a busy controller, but a refresh that comes out wrong is
-        // diagnosable and a deadlock is not.
+        // Bounded: a wedged BUSY would otherwise hang the caller forever,
+        // which on a badge with no debug probe is indistinguishable from a
+        // crash and cannot be diagnosed.
         let _ = embassy_time::with_timeout(BUSY_CLEAR_TIMEOUT, self.busy.wait_for_low()).await;
         Ok(())
     }
 
     async fn busy_wait_for_completion(&mut self) -> Result<(), SpiDev::Error> {
+        // See BUSY_CLEAR_TIMEOUT: both waits below are bounded.
         // wait_for_high() handles the race: if BUSY already asserted before we
         // get here, it returns immediately rather than missing the edge.
-        //
-        // Both waits are bounded. A waveform whose drive phases are all zero
-        // -- which is what patching the inversion phases out of some OTP LUTs
-        // leaves behind -- completes without ever raising BUSY, and an
-        // unbounded wait_for_high() then hangs the caller forever with no
-        // way to diagnose it. Timing out and returning leaves the panel
-        // showing whatever it managed, which is the same outcome the caller
-        // would see from a waveform that did nothing, and lets playback carry
-        // on instead of wedging.
         if embassy_time::with_timeout(BUSY_ASSERT_TIMEOUT, self.busy.wait_for_high())
             .await
             .is_err()

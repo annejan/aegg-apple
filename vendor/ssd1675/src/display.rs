@@ -27,14 +27,6 @@ const LUT_TABLE_MIN_C10: i32 = (LUT_TABLE_MIN_C as i32) * 10;
 /// caller calls `set_active_temperature`.  20 °C — typical indoor ambient.
 const DEFAULT_ACTIVE_TEMP_C10: i16 = 200;
 
-/// Upper bound on how long [`Display::reset`] waits for an in-flight drive
-/// waveform to finish before pulsing RES#.  A full refresh is ~2-4 s at room
-/// temperature and stretches when the panel is cold (badges live outdoors), so
-/// this is a generous backstop — under normal operation the wave completes long
-/// before it and the timeout never elapses.  If it ever does (wedged BUSY), the
-/// old abort-and-reset behaviour resumes.
-const RESET_ACTIVATION_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(12);
-
 /// Waveform update mode passed to `update_bw()`.
 #[derive(Clone, Copy, PartialEq)]
 pub enum UpdateMode {
@@ -138,6 +130,29 @@ pub fn patch_no_invert(lut: &mut [u8; 107], variant: DisplayVariant) {
         }
         DisplayVariant::Ssd1675B => {
             // 10-byte rows: waveform 0–49, TP 50–99 (10 groups × {A,B,C,D,RP}).
+            // Row R phase P lives at byte R*10 + P.
+
+            // ── Zero the red (LUT2), NOOP (LUT3) and VCOM (LUT4) rows ─────
+            // LUT2 is the red class. This panel is tri-colour, so black and
+            // red pigment both respond to drive; a delta waveform that leaves
+            // the red row active pulls red particles up on pixels that were
+            // only ever meant to be black or white, and the image goes pink.
+            // Nothing routes to LUT2 here (the red plane is always zero), so
+            // zeroing it costs nothing.
+            // LUT3 is the ignore/NOOP class: pixels whose colour is unchanged
+            // route here.  LUT4 is the VCOM modulation row.  On the delta
+            // path any residual OTP drive in these rows applies a small
+            // per-refresh voltage to pixels that should hold — over several
+            // partial refreshes that bias accumulates and visibly FADES the
+            // held pixels.  Zero both rows in the delta base so unchanged and
+            // VCOM-idle pixels see exactly 0 V; static VCOM comes from the
+            // cmd 0x2C trailer instead.  (patch_lut_for_partial also zeroes
+            // these downstream, but zeroing the base guarantees it for every
+            // consumer of select_no_invert, e.g. update_bw.)
+            lut[20..30].fill(0); // LUT2 — red class
+            lut[30..40].fill(0); // LUT3 — NOOP / ignore class
+            lut[40..50].fill(0); // LUT4 — VCOM
+
             // Strip the inversion/erase phases (0–2)…
             lut[50..64].fill(0);
             // …and cap the repeat count (RP byte = group base + 4) to a single
@@ -511,26 +526,20 @@ where
     ///
     /// If a drive waveform may still be running (a previous refresh's future
     /// was dropped or errored between master activation and completion —
-    /// [`activation_pending`]), wait for BUSY to fall first (bounded by
-    /// [`RESET_ACTIVATION_TIMEOUT`]) so the RES# pulse below cannot abort the
-    /// waveform mid-phase and freeze the panel (inverted, on SSD1675B).  The
-    /// timeout is a backstop against a wedged BUSY; on completion the panel
-    /// simply shows the intended frame and the caller's stale shadow/dirty
-    /// state self-heals on the next refresh.
+    /// [`activation_pending`]), the RES# pulse below aborts it immediately on
+    /// both variants.  On SSD1675B this can leave pixels frozen mid-phase
+    /// (inverted), but a cancelled refresh never commits, so those pixels stay
+    /// dirty and the next refresh re-drives them to target — the dirty buffer
+    /// makes the snappy abort safe.
     pub async fn reset(&mut self) -> Result<(), I::Error> {
         if self.activation_pending {
-            // Only SSD1675B freezes inverted when RES# aborts a waveform
-            // mid-phase, so only B pays the wait-out cost.  On A the RES#
-            // pulse below aborts the in-flight drive harmlessly, which is
-            // exactly what makes the interrupt-driven redraw feel snappy —
-            // don't stall it.
-            if self.variant == DisplayVariant::Ssd1675B {
-                let _ = embassy_time::with_timeout(
-                    RESET_ACTIVATION_TIMEOUT,
-                    self.interface.busy_wait(),
-                )
-                .await;
-            }
+            // Interrupt-abort: the RES# pulse below stops the in-flight
+            // waveform immediately on BOTH variants — no wait-out.  B can
+            // freeze mid-phase inverted, but a cancelled refresh never
+            // commits, so every pixel it was driving stays dirty; the next
+            // refresh (screen-change `mark_all` or the pending dirty set)
+            // re-drives them to target.  The dirty buffer is what makes the
+            // snappy abort safe on B.
             self.activation_pending = false;
         }
         self.interface.reset().await;
@@ -861,6 +870,17 @@ where
             state.set_in_flight(false);
         }
 
+        // Tag EVERY pixel dirty at the start of the full-refresh sequence.
+        // A full drives the whole panel, so if this refresh is interrupted
+        // mid-wave the dirty set must already cover every pixel — otherwise
+        // the follow-up call (which the counter reset below demotes to a
+        // partial) would re-drive only the pixels that happened to be dirty,
+        // leaving the rest (e.g. already-committed red) half-driven → the
+        // missing-red artifact.  `commit_refresh` at the end clears the whole
+        // set once the wave completes.  Callers no longer need to mark dirty
+        // themselves (see `force_full_refresh`).
+        state.mark_all_dirty();
+
         state.build_planes_full();
 
         // Full-refresh LUT (with inversion) — the calibrated override when one
@@ -934,11 +954,8 @@ where
         state: &mut crate::partial::PartialState,
         lut_speed: u8,
     ) -> Result<(), I::Error> {
-        // Mark every pixel dirty so commit_refresh inside
-        // update_full_from_state captures the full frame into
-        // shadow (matches the spec: "drive whole panel.  pixels
-        // that moved during full refresh stay dirty").
-        state.mark_all_dirty();
+        // `update_full_from_state` tags every pixel dirty at the start of
+        // the sequence, so no explicit mark_all_dirty is needed here.
         self.update_full_from_state(state, lut_speed).await
     }
 

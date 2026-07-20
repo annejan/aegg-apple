@@ -65,7 +65,17 @@ const MAX_FRAME_BYTES: usize = 8 * 1024;
 /// drives the pixels less far -- at the fast end the image can be too faint to
 /// read. Start at the OEM timing, which is definitely visible, and tune down
 /// once the picture is confirmed on the panel.
-const LUT_SPEED: u8 = 8;
+const LUT_SPEED: u8 = 15;
+
+/// Every so often, drive a frame with a heavier waveform.
+///
+/// A light waveform is fast but does not push each pixel all the way to its
+/// target, so contrast bleeds away over consecutive frames. This is still a
+/// partial refresh -- only changed pixels, no full-screen flash -- it just
+/// drives them properly, which pulls the image back without interrupting the
+/// video the way a full refresh would.
+const STRONG_EVERY: u32 = 8;
+const STRONG_LUT_SPEED: u8 = 45;
 
 /// Backstop for a single panel refresh. Longer than the slowest full
 /// waveform (~6 s) so it only fires on a genuinely stuck controller.
@@ -196,9 +206,11 @@ async fn main(spawner: Spawner) {
     )
     .await;
 
-    // Deliberately no clearing full refresh. It costs ~12 s of flashing
-    // before a single frame appears, and the ghosting it would clear is
-    // wanted here -- the artifacting is part of the look.
+    // No full refresh, not even at the start. The full waveform on this panel
+    // does not complete -- it runs past its budget and leaves BUSY asserted,
+    // and every partial after it then inherits a busy controller and stalls.
+    // Starting straight into partials keeps BUSY clean, and the ghosting the
+    // clear would have removed is wanted anyway.
     crate::log!("panel: init done, busy={}, starting audio", epd::busy_level() as u8);
     led_blue.set_high();
 
@@ -285,6 +297,7 @@ async fn play(
     let started = Instant::now();
     let mut warned_silent = false;
     let mut stalled: u32 = 0;
+    let mut drawn: u32 = 0;
 
     // Heartbeat for the audio clock. The whole frame-selection scheme rests on
     // `samples_played()` advancing; if it sticks, the video freezes on one
@@ -372,7 +385,13 @@ async fn play(
         // guarantees the loop keeps running whatever the panel does -- a
         // stalled refresh costs one frame, not the whole video.
         let refresh_started = Instant::now();
-        let timed_out = with_timeout(REFRESH_TIMEOUT, panel.show(&plane, LUT_SPEED))
+        let speed = if drawn % STRONG_EVERY == STRONG_EVERY - 1 {
+            STRONG_LUT_SPEED
+        } else {
+            LUT_SPEED
+        };
+        drawn += 1;
+        let timed_out = with_timeout(REFRESH_TIMEOUT, panel.show(&plane, speed))
             .await
             .is_err();
         let elapsed_ms = refresh_started.elapsed().as_millis();
