@@ -1,0 +1,19 @@
+[build]
+# Unlike the upstream badge firmware there is no host-side simulator in this
+# crate — every target of every build is the badge — so the embedded triple is
+# the default and `cargo build` needs no `--target`.
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip nRF52840_xxAA"
+# flip-link relocates the stack to the bottom of RAM so a stack overflow faults
+# immediately instead of silently corrupting statics.
+linker = "flip-link"
+
+[env]
+DEFMT_LOG = "info"
+
+[alias]
+fw = "build --release"
+flash = "run --release"
+flash-debug = "run --profile release-debug"

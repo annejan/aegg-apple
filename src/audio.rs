@@ -45,6 +45,29 @@ const MAX_BLOCK_BYTES: usize = 1024;
 /// The nRF52840 PWM base clock, with `Prescaler::Div1`.
 const PWM_CLOCK_HZ: u32 = 16_000_000;
 
+/// Largest counter top we will accept before trading resolution for carrier
+/// frequency. 320 puts the carrier at 50 kHz or above -- inaudible -- while
+/// still leaving over eight bits of duty resolution.
+const MAX_TOP: u32 = 320;
+
+/// Choose a counter top and hold count for a sample rate.
+///
+/// Returns `(top, refresh)` such that `top * (refresh + 1)` PWM ticks make up
+/// one sample period. `refresh` is the number of *extra* periods each sample
+/// is held for, so the sample rate is `PWM_CLOCK_HZ / (top * (refresh + 1))`.
+fn carrier_for(sample_rate: u32) -> (u16, u32) {
+    let rate = sample_rate.max(1);
+    let mut refresh = 0u32;
+    loop {
+        let top = PWM_CLOCK_HZ / (rate * (refresh + 1));
+        if top <= MAX_TOP || refresh >= 15 {
+            // Never return a top of 0, which would stop the counter.
+            return (top.max(2) as u16, refresh);
+        }
+        refresh += 1;
+    }
+}
+
 /// Total samples handed to the PWM peripheral since playback began.
 static SAMPLES_PLAYED: AtomicU32 = AtomicU32::new(0);
 
@@ -162,10 +185,25 @@ pub async fn play<R: AssetRead>(
     reader: R,
     header: SoundHeader,
 ) {
-    // One PWM period per sample. Any remainder here is a fixed pitch error:
-    // 6000 Hz wants 2666.67 and gets 2667, which is 0.012% flat -- about 27
-    // ms of drift across the whole track, far below a video frame.
-    let top = (PWM_CLOCK_HZ / header.sample_rate).min(32767) as u16;
+    // Split the sample period into a fast PWM carrier plus a hold count.
+    //
+    // The obvious arrangement -- one PWM period per sample -- puts the
+    // carrier *at* the sample rate, so the pin emits a 6 kHz square wave
+    // whose duty wobbles. That is audible as a loud tone, not as music. The
+    // carrier has to sit above hearing and each sample must be held for
+    // several periods, which is what `refresh` does.
+    //
+    // At 6 kHz this settles on top = 296 (a 54 kHz carrier) held for 9
+    // periods, giving 6006 Hz -- 0.1% fast, and since audio is the master
+    // clock the video simply follows it.
+    let (top, refresh) = carrier_for(header.sample_rate);
+    defmt::info!(
+        "audio: {} Hz, carrier {} Hz, top {}, refresh {}",
+        PWM_CLOCK_HZ / (top as u32 * (refresh + 1)),
+        PWM_CLOCK_HZ / top as u32,
+        top,
+        refresh
+    );
 
     let mut config = Config::default();
     config.prescaler = Prescaler::Div1;
@@ -200,10 +238,11 @@ pub async fn play<R: AssetRead>(
         )
     };
 
-    let seq_config = SequenceConfig {
-        refresh: 0,
-        end_delay: 0,
-    };
+    // No gap between the two buffers -- any end_delay is an audible click at
+    // every buffer boundary.
+    let mut seq_config = SequenceConfig::default();
+    seq_config.refresh = refresh;
+    seq_config.end_delay = 0;
     let sequencer = Sequencer::new(
         &mut pwm,
         Sequence::new(words0.as_slice(), seq_config.clone()),

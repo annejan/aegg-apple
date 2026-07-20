@@ -54,11 +54,6 @@ impl VideoHeader {
     pub fn offset_entry(&self, frame: u32) -> u32 {
         HEADER_LEN as u32 + frame * 4
     }
-
-    /// Duration of the whole clip in milliseconds.
-    pub fn duration_ms(&self) -> u32 {
-        self.frame_count * 1000 / self.fps as u32
-    }
 }
 
 /// Decode a bit-run-length coded frame into a 1bpp plane.
