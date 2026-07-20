@@ -1,0 +1,8 @@
+/target
+/build
+/assets/*.webm
+/assets/*.mp4
+/assets/frames/
+*.bin
+*.uf2
+.DS_Store
