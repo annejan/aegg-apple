@@ -25,8 +25,9 @@ VID_MAGIC = b"AEGGVID1"
 SND_MAGIC = b"AEGGSND1"
 
 # Samples per ADPCM block. Each block restarts the predictor so the player
-# can seek without decoding everything before it.
-BLOCK_SAMPLES = 1017  # 1017 samples -> 4-byte header + 509 bytes = 513
+# can seek without decoding everything before it. The first sample lives in
+# the header, leaving 1016 nibbles: 4 + 508 = a round 512 bytes per block.
+BLOCK_SAMPLES = 1017
 
 
 # --- video ----------------------------------------------------------------
