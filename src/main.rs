@@ -65,7 +65,15 @@ const MAX_FRAME_BYTES: usize = 8 * 1024;
 /// drives the pixels less far -- at the fast end the image can be too faint to
 /// read. Start at the OEM timing, which is definitely visible, and tune down
 /// once the picture is confirmed on the panel.
-const LUT_SPEED: u8 = 15;
+/// Selectable waveform strengths, cycled with Fire.
+///
+/// This is a genuine trade with no right answer: a lighter waveform
+/// refreshes faster but drives each pixel less far, so the image softens and
+/// the previous frame shows through. Where the sweet spot sits depends on
+/// the panel, the temperature and what looks good to the person holding it,
+/// so it is a button rather than a constant.
+const LUT_SPEEDS: [u8; 5] = [8, 15, 30, 60, 100];
+const DEFAULT_SPEED_IDX: usize = 2;
 
 /// Every so often, drive a frame with a heavier waveform.
 ///
@@ -74,8 +82,7 @@ const LUT_SPEED: u8 = 15;
 /// partial refresh -- only changed pixels, no full-screen flash -- it just
 /// drives them properly, which pulls the image back without interrupting the
 /// video the way a full refresh would.
-const STRONG_EVERY: u32 = 8;
-const STRONG_LUT_SPEED: u8 = 45;
+const STRONG_EVERY: u32 = 4;
 
 /// Backstop for a single panel refresh. Longer than the slowest full
 /// waveform (~6 s) so it only fires on a genuinely stuck controller.
@@ -255,8 +262,6 @@ async fn main(spawner: Spawner) {
 enum Stop {
     /// Ran to the end of the video. The happy path.
     Complete = 1,
-    /// Fire was held.
-    Fire = 2,
     /// The audio stream ended first.
     AudioEnded = 3,
     /// The offset table or frame data could not be read.
@@ -270,7 +275,6 @@ impl Stop {
     fn name(self) -> &'static str {
         match self {
             Stop::Complete => "complete",
-            Stop::Fire => "fire held",
             Stop::AudioEnded => "audio ended",
             Stop::ReadFailed => "read failed",
             Stop::DecodeFailed => "decode failed",
@@ -298,6 +302,8 @@ async fn play(
     let mut warned_silent = false;
     let mut stalled: u32 = 0;
     let mut drawn: u32 = 0;
+    let mut speed_idx = DEFAULT_SPEED_IDX;
+    let mut fire_was = false;
 
     // Heartbeat for the audio clock. The whole frame-selection scheme rests on
     // `samples_played()` advancing; if it sticks, the video freezes on one
@@ -319,9 +325,20 @@ async fn play(
             );
         }
 
-        if fire.is_low() {
-            return Stop::Fire;
+        // Fire cycles the waveform strength. Edge-triggered, so holding it
+        // steps once rather than racing through every setting.
+        let fire_now = fire.is_low();
+        if fire_now && !fire_was {
+            speed_idx = (speed_idx + 1) % LUT_SPEEDS.len();
+            defmt::info!(
+                "LUT speed -> {} ({} of {})",
+                LUT_SPEEDS[speed_idx],
+                speed_idx + 1,
+                LUT_SPEEDS.len()
+            );
+            crate::log!("LUT speed -> {}", LUT_SPEEDS[speed_idx]);
         }
+        fire_was = fire_now;
         if audio::finished() {
             return Stop::AudioEnded;
         }
@@ -385,10 +402,13 @@ async fn play(
         // guarantees the loop keeps running whatever the panel does -- a
         // stalled refresh costs one frame, not the whole video.
         let refresh_started = Instant::now();
+        let base = LUT_SPEEDS[speed_idx];
+        // The periodic heavy frame scales with the chosen strength, so the
+        // whole trade moves together instead of fighting the setting.
         let speed = if drawn % STRONG_EVERY == STRONG_EVERY - 1 {
-            STRONG_LUT_SPEED
+            base.saturating_mul(2).min(100)
         } else {
-            LUT_SPEED
+            base
         };
         drawn += 1;
         let timed_out = with_timeout(REFRESH_TIMEOUT, panel.show(&plane, speed))
