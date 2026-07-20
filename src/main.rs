@@ -23,12 +23,30 @@ mod fat12;
 mod video;
 
 mod flash;
+mod usblog;
 
 use embassy_executor::Spawner;
 use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::peripherals;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-use {defmt_rtt as _, panic_probe as _};
+use defmt_rtt as _;
+
+/// Panic handler that is visible without a debug probe.
+///
+/// `panic_probe` traps the CPU, which on a badge with nothing attached is
+/// indistinguishable from a deadlock -- both look like "everything stopped".
+/// Lighting the red LED separates the two, and that distinction has cost
+/// several blind reflash cycles already.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // Red LED is P1_07, active low: clearing the output drives it on. Done
+    // through the PAC because a panic cannot borrow the GPIO driver.
+    embassy_nrf::pac::P1.dirset().write(|w| w.0 = 1 << 7);
+    embassy_nrf::pac::P1.outclr().write(|w| w.0 = 1 << 7);
+    loop {
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 use adpcm::SoundHeader;
 use asset::AssetRead;
@@ -47,11 +65,11 @@ const MAX_FRAME_BYTES: usize = 8 * 1024;
 /// drives the pixels less far -- at the fast end the image can be too faint to
 /// read. Start at the OEM timing, which is definitely visible, and tune down
 /// once the picture is confirmed on the panel.
-const LUT_SPEED: u8 = 100;
+const LUT_SPEED: u8 = 8;
 
 /// Backstop for a single panel refresh. Longer than the slowest full
 /// waveform (~6 s) so it only fires on a genuinely stuck controller.
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A file on the badge's FAT12 volume, read a piece at a time.
 #[derive(Clone, Copy)]
@@ -62,6 +80,22 @@ impl AssetRead for FatFile {
         // A failed read is reported as a short read, which both players treat
         // as end of stream -- better than feeding them stale buffer contents.
         fat12::read_at(&self.0, offset, buf).await.unwrap_or(0)
+    }
+}
+
+/// Proof-of-life, independent of both the player and the audio task.
+///
+/// If these lines keep coming while everything else has gone quiet, the
+/// executor is still scheduling and something is blocked on an await. If they
+/// stop too, the whole executor is wedged. That distinction is not otherwise
+/// observable on a badge with no debug probe.
+#[embassy_executor::task]
+async fn heartbeat_task() {
+    let mut n: u32 = 0;
+    loop {
+        Timer::after(Duration::from_millis(500)).await;
+        n += 1;
+        crate::log!("hb {} (samples {}, busy {})", n, audio::samples_played(), crate::epd::busy_level() as u8);
     }
 }
 
@@ -78,6 +112,26 @@ async fn audio_task(
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
+
+    // USB serial first, before anything that can hang or panic.
+    //
+    // This badge has no debug probe on it, so `defmt` goes nowhere in the
+    // field and the three LEDs are the entire diagnostic surface. Bringing
+    // CDC-ACM up here means flash init, panel detection and header parsing --
+    // the parts most likely to be wrong -- are all inside the window where
+    // logging works. `usblog::run` starts HFXO itself (USBD cannot enumerate
+    // on the internal RC) and returns false rather than blocking if the
+    // crystal is dead.
+    let usb_ok = usblog::run(p.USBD, &spawner).await;
+
+    // Enumeration, driver bind and the host opening the port take a moment,
+    // and anything logged before that is dropped -- the queue deliberately
+    // discards lines while no terminal is attached. Two seconds is enough for
+    // udev + a terminal that is already waiting on /dev/ttyACM0.
+    if usb_ok {
+        Timer::after(Duration::from_secs(2)).await;
+    }
+    crate::log!("aegg-apple: Bad Apple!! player starting");
 
     // LEDs are active low: blue on while loading, red blinks on failure.
     let mut led_blue = Output::new(board!(p, led_blue), Level::Low, OutputDrive::Standard);
@@ -96,6 +150,7 @@ async fn main(spawner: Spawner) {
         board!(p, flash_io3),
     )
     .await;
+    crate::log!("flash: QSPI up, USB log {}", if usb_ok { "on" } else { "off" });
 
     let Some((video_file, video_header)) = open_video().await else {
         fail(&mut led_red).await
@@ -111,6 +166,24 @@ async fn main(spawner: Spawner) {
         sound_header.sample_count,
         sound_header.sample_rate
     );
+    // The parsed headers, in full. A wrong frame count, fps or sample rate
+    // here explains any amount of downstream weirdness, and until now there
+    // was no way to see them on a probe-less badge.
+    crate::log!(
+        "video: {}x{}, {} frames @ {} fps",
+        video_header.width,
+        video_header.height,
+        video_header.frame_count,
+        video_header.fps
+    );
+    crate::log!(
+        "sound: {} samples @ {} Hz, {} blocks of {} samples / {} bytes",
+        sound_header.sample_count,
+        sound_header.sample_rate,
+        sound_header.block_count(),
+        sound_header.block_samples,
+        sound_header.block_bytes
+    );
 
     let mut panel = epd::Panel::init(
         board!(p, epd_spi),
@@ -123,11 +196,13 @@ async fn main(spawner: Spawner) {
     )
     .await;
 
-    // Start from clean white: a flashing full refresh clears whatever ghost
-    // the previous firmware left behind.
-    panel.clear_white().await;
+    // Deliberately no clearing full refresh. It costs ~12 s of flashing
+    // before a single frame appears, and the ghosting it would clear is
+    // wanted here -- the artifacting is part of the look.
+    crate::log!("panel: init done, busy={}, starting audio", epd::busy_level() as u8);
     led_blue.set_high();
 
+    spawner.must_spawn(heartbeat_task());
     spawner.must_spawn(audio_task(
         board!(p, buzzer_pwm),
         board!(p, buzzer),
@@ -150,6 +225,7 @@ async fn main(spawner: Spawner) {
     // reported by blinking it out on the red LED. The last frame is left on
     // the panel deliberately -- clearing it would throw away evidence.
     defmt::info!("stopped: {}", stop as u8);
+    crate::log!("stopped: {} ({})", stop as u8, stop.name());
     loop {
         for _ in 0..stop as u8 {
             led_red.set_low();
@@ -177,6 +253,19 @@ enum Stop {
     DecodeFailed = 5,
 }
 
+impl Stop {
+    /// Human-readable form of the blink count, for the USB log.
+    fn name(self) -> &'static str {
+        match self {
+            Stop::Complete => "complete",
+            Stop::Fire => "fire held",
+            Stop::AudioEnded => "audio ended",
+            Stop::ReadFailed => "read failed",
+            Stop::DecodeFailed => "decode failed",
+        }
+    }
+}
+
 /// Drive the video stream against the audio clock until it ends, the stream
 /// runs out, or Fire is pressed.
 async fn play(
@@ -197,7 +286,26 @@ async fn play(
     let mut warned_silent = false;
     let mut stalled: u32 = 0;
 
+    // Heartbeat for the audio clock. The whole frame-selection scheme rests on
+    // `samples_played()` advancing; if it sticks, the video freezes on one
+    // frame and there is otherwise no way to tell that from a stuck panel.
+    let mut next_tick = Instant::now();
+
     loop {
+        if Instant::now() >= next_tick {
+            // Rescheduled from *now*, not from the previous deadline: a panel
+            // refresh can hold the loop for seconds, and a fixed cadence would
+            // then fire the heartbeat on every iteration to catch up.
+            next_tick = Instant::now() + Duration::from_secs(1);
+            crate::log!(
+                "tick: samples {}, shown {}, skipped {}, stalled {}",
+                audio::samples_played(),
+                shown.map(|f| f as i64).unwrap_or(-1),
+                skipped,
+                stalled
+            );
+        }
+
         if fire.is_low() {
             return Stop::Fire;
         }
@@ -217,6 +325,7 @@ async fn play(
         } else if started.elapsed() > Duration::from_millis(1500) {
             if !warned_silent {
                 defmt::warn!("no audio after 1.5 s; running video on the wall clock");
+                crate::log!("no audio after 1.5 s; running video on the wall clock");
                 warned_silent = true;
             }
             let ms = started.elapsed().as_millis();
@@ -241,13 +350,16 @@ async fn play(
         }
         shown = Some(target);
 
+        crate::log!("f{}: reading", target);
         let Some(len) = read_frame(&mut file, &header, target, &mut encoded).await else {
             defmt::warn!("frame {} unreadable", target);
+            crate::log!("frame {} unreadable", target);
             return Stop::ReadFailed;
         };
 
         if video::decode_frame(&encoded[..len], &mut plane).is_none() {
             defmt::warn!("frame {} did not decode", target);
+            crate::log!("frame {} did not decode ({} coded bytes)", target, len);
             return Stop::DecodeFailed;
         }
 
@@ -255,19 +367,33 @@ async fn play(
         // distinguishes "never reached the panel" from "the panel refresh
         // never returned" without a debug probe.
         led_green.toggle();
+        crate::log!("f{}: decoded {} B, busy={}, refreshing", target, len, epd::busy_level() as u8);
         // Outer backstop. The driver's own BUSY waits are bounded, but this
         // guarantees the loop keeps running whatever the panel does -- a
         // stalled refresh costs one frame, not the whole video.
-        if with_timeout(REFRESH_TIMEOUT, panel.show(&plane, LUT_SPEED))
+        let refresh_started = Instant::now();
+        let timed_out = with_timeout(REFRESH_TIMEOUT, panel.show(&plane, LUT_SPEED))
             .await
-            .is_err()
-        {
+            .is_err();
+        let elapsed_ms = refresh_started.elapsed().as_millis();
+        if timed_out {
             stalled += 1;
             defmt::warn!("refresh timed out on frame {} ({} so far)", target, stalled);
         }
         led_blue.toggle();
 
         defmt::info!("frame {} ({} skipped)", target, skipped);
+        // One line per shown frame: index, coded size, how long the panel
+        // actually took, and whether the backstop fired. This is the record
+        // that says whether the panel or the clock is the thing going wrong.
+        crate::log!(
+            "frame {}: {} B, show {} ms{}, skipped {}",
+            target,
+            len,
+            elapsed_ms,
+            if timed_out { " TIMEOUT" } else { "" },
+            skipped
+        );
     }
 }
 
@@ -318,6 +444,7 @@ async fn open_sound() -> Option<(FatFile, SoundHeader)> {
 /// failure is visible without a debugger attached.
 async fn fail(led: &mut Output<'static>) -> ! {
     defmt::error!("assets missing or unreadable");
+    crate::log!("FATAL: assets missing or unreadable");
     loop {
         led.toggle();
         Timer::after(Duration::from_millis(200)).await;

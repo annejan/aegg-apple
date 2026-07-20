@@ -110,14 +110,26 @@ pub fn decode_block(block: &[u8], out: &mut [i16]) -> usize {
     n
 }
 
+/// Playback gain, applied before the sample is mapped to a duty cycle.
+///
+/// A piezo is a poor loudspeaker: no cone, no enclosure, and a sharp
+/// mechanical resonance well above the fundamentals of most music, so a
+/// faithfully reproduced waveform is barely audible. Gain here clips the
+/// loud parts, which is a crude limiter -- it raises average power a lot for
+/// a modest amount of distortion, and on this transducer that trade is
+/// strongly worth it.
+pub const GAIN: i32 = 4;
+
 /// Map a signed sample onto a PWM duty value in `0..=top`.
 ///
 /// The piezo is driven single-ended, so silence sits at half scale and the
-/// waveform swings either side of it.
+/// waveform swings either side of it. The result is clamped, so gain above
+/// unity clips rather than wrapping -- wrapping would turn a loud passage
+/// into noise.
 #[inline]
 pub fn sample_to_duty(sample: i16, top: u16) -> u16 {
     let mid = top as i32 / 2;
-    (mid + (sample as i32 * mid) / 32768).clamp(0, top as i32) as u16
+    (mid + (sample as i32 * GAIN * mid) / 32768).clamp(0, top as i32) as u16
 }
 
 #[cfg(test)]
@@ -165,5 +177,7 @@ mod tests {
         assert_eq!(sample_to_duty(0, 2666), 1333);
         assert_eq!(sample_to_duty(i16::MIN, 2666), 0);
         assert!(sample_to_duty(i16::MAX, 2666) <= 2666);
+        // Gain clips instead of wrapping.
+        assert_eq!(sample_to_duty(i16::MAX / 2, 2666), 2666);
     }
 }

@@ -204,6 +204,13 @@ pub async fn play<R: AssetRead>(
         top,
         refresh
     );
+    crate::log!(
+        "audio: {} Hz, carrier {} Hz, top {}, refresh {}",
+        PWM_CLOCK_HZ / (top as u32 * (refresh + 1)),
+        PWM_CLOCK_HZ / top as u32,
+        top,
+        refresh
+    );
 
     let mut config = Config::default();
     config.prescaler = Prescaler::Div1;
@@ -214,6 +221,7 @@ pub async fn play<R: AssetRead>(
         Ok(pwm) => pwm,
         Err(_) => {
             defmt::error!("audio: PWM init failed");
+            crate::log!("audio: PWM init failed");
             return;
         }
     };
@@ -254,6 +262,7 @@ pub async fn play<R: AssetRead>(
         .is_err()
     {
         defmt::error!("audio: sequencer start failed");
+        crate::log!("audio: sequencer start failed");
         return;
     }
 

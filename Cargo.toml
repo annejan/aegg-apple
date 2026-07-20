@@ -27,6 +27,13 @@ embassy-time = { version = "0.5.0", features = [
 ] }
 embassy-sync = { version = "0.7", features = ["defmt"] }
 embassy-futures = { version = "0.1.2" }
+# USB CDC-ACM serial console -- the only way to get diagnostics off a badge
+# with no debug probe attached.  `default-features = false` keeps its own
+# `log`/`defmt` plumbing out; this firmware only uses it as a transport.
+embassy-usb = { version = "0.6.0", default-features = false }
+
+# Fixed-capacity `String` for formatting log lines without an allocator.
+heapless = { version = "0.9.3" }
 
 # ── Cortex-M runtime ─────────────────────────────────────────────────────
 cortex-m = { version = "0.7.7", features = [

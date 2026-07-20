@@ -38,9 +38,10 @@ use embassy_nrf::spim::{Config, Frequency, InterruptHandler, Spim};
 use embassy_nrf::{Peri, bind_interrupts, peripherals};
 use embassy_time::Timer;
 use embedded_hal_bus::spi::ExclusiveDevice;
+use ssd1675::partial::{PartialConfig, PartialState, sync_from_planes};
 use ssd1675::{
     Builder, Color, Dimensions, Display, DisplayVariant, GraphicDisplay, Interface,
-    LUT_TABLE_SIZE, Rotation, UpdateMode, detect_variant_from_otp, patch_no_invert,
+    LUT_TABLE_SIZE, Rotation, detect_variant_from_otp, patch_no_invert,
 };
 use static_cell::StaticCell;
 
@@ -87,12 +88,42 @@ static WORK_CELL: StaticCell<[u8; BUF_SIZE]> = StaticCell::new();
 
 /// The red plane handed to `update_bw` on every frame.  This panel is
 /// driven black/white only, so it is permanently zero.
-static RED_ZEROS: [u8; BUF_SIZE] = [0u8; BUF_SIZE];
+///
+/// It must live in **RAM**, not `.rodata`.  A plain `static [u8; N]` is
+/// read-only data in flash, and EasyDMA cannot read flash: `embassy-nrf`
+/// quietly falls back to copying the transfer through a 512-byte RAM bounce
+/// buffer, which panics on anything larger — and a plane is 2888 bytes.  That
+/// is exactly why `clear_white` worked (it uses the driver's own
+/// `StaticCell` planes, already in RAM) while every `show` died.
+static RED_ZEROS_CELL: StaticCell<[u8; BUF_SIZE]> = StaticCell::new();
+
+/// Shadow/dirty state for the partial-refresh engine (~46 KB of .bss).
+///
+/// Worth it: `update_partial` is the path the badge firmware actually drives
+/// the panel with, at roughly 500 ms a refresh. Feeding the no-invert LUT
+/// straight to `update_bw` instead -- a path nothing else exercises -- leaves
+/// the controller driving forever with BUSY never falling.
+static PARTIAL_CELL: StaticCell<PartialState> = StaticCell::new();
+
+/// Temperature handed to the OTP TR-search, 12-bit signed in 1/16 °C.
+/// 0x190 = 400 = 25 °C, which is also the controller's own POR default.
+const ROOM_TEMP_RAW: u16 = 25 * 16;
 
 /// Single-shot guard: [`Panel::init`] steals SPI3 and the GPIOs during the
 /// OTP probe, so calling it twice would hand out two owners of the same
 /// peripherals.
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Read the BUSY pin straight out of the GPIO peripheral.
+///
+/// The driver owns the `Input`, so this is the only way to observe the line
+/// from outside it. Worth having: the panel's BUSY behaviour is the thing
+/// that decides whether a refresh ever completes, and a stuck or inverted
+/// BUSY looks exactly like a hung player from the outside.
+pub fn busy_level() -> bool {
+    // P0_14.
+    (embassy_nrf::pac::P0.in_().read().0 >> 14) & 1 != 0
+}
 
 fn pin_nr(p: &Peri<'_, AnyPin>) -> u8 {
     let port = match p.port() {
@@ -106,24 +137,21 @@ fn pin_nr(p: &Peri<'_, AnyPin>) -> u8 {
 ///
 /// Sequence (per SSD1619 reference driver):
 ///   1. Hardware reset + 100 ms settle
-///   2. Select the on-chip internal temperature sensor (0x18 = 0x80) — the
-///      SSD1675 will use its own die measurement when the next LoadTemp step
-///      runs.  The SoC's idea of temperature is *not* written: the panel's
-///      internal sensor is more representative of the panel itself than the
-///      nRF52840's die.
-///   3. Send 0x22 / 0xB1 — EnableClock | LoadTemp | LoadLUT-Mode1 |
-///      DisableClock
+///   2. Select the temperature sensor (0x18 = 0x80), then write the
+///      temperature manually via 0x1A — the controller has no on-die sensor
+///      to sample.
+///   3. Send 0x22 / 0x91 — EnableClock | LoadLUT-Mode1 | DisableClock, with
+///      no LoadTemp bit so the written temperature survives
 ///   4. Send 0x20 — Master Activation (BUSY goes HIGH while controller loads
 ///      OTP zone)
 ///   5. Wait for BUSY LOW (controller has finished loading the temperature
 ///      zone into the LUT register)
 ///   6. Send 0x33 command then read 107 bytes — the loaded LUT zone
 ///
-/// The badge firmware instead writes a synthesised temperature via cmd 0x1A
-/// and uses `0x22 = 0x91` (no LoadTemp) so the chip's TR-search lands in a
-/// different band on each of its 16 passes.  Here we probe exactly once and
-/// *want* the controller's own idea of the current band, so the documented
-/// LoadTemp form above is used verbatim and the 0x1A write is gone.
+/// `temp_raw` is the temperature the TR-search matches against, 12-bit
+/// signed in 1/16 °C.  The badge firmware sweeps 16 synthesised values to
+/// build a per-band table; this firmware passes one room-temperature value,
+/// because a single indoor playthrough never leaves the band.
 ///
 /// All stolen resources are dropped (or `mem::forget`'d, see below) before
 /// returning.
@@ -134,6 +162,7 @@ async fn probe_lut(
     dc: &Peri<'_, AnyPin>,
     rst: &Peri<'_, AnyPin>,
     busy: &Peri<'_, AnyPin>,
+    temp_raw: u16,
 ) -> [u8; 107] {
     let sck_nr = pin_nr(sck);
     let data_nr = pin_nr(data);
@@ -233,21 +262,35 @@ async fn probe_lut(
             unsafe { AnyPin::steal(data_nr) },
             cfg.clone(),
         );
-        // 0x18 = 0x80: select the *internal* temperature sensor (B-variant
-        // documented; A-variant accepts as a no-op per the gap on pg 23).
-        // The LoadTemp step below then samples it, so the controller's own
-        // TR-search picks the band for the actual ambient temperature.
+        // 0x18 = 0x80: select the internal temperature sensor.
         dc_out.set_low();
         spi_tx.write(&[0x18]).await.ok();
         dc_out.set_high();
         spi_tx.write(&[0x80]).await.ok();
-        // 0x22 / 0xB1: EnableClock | LoadTemp | LoadLUT-OTP-Mode1 |
-        // DisableClock.  LoadTemp re-samples the sensor selected by 0x18 —
-        // exactly what we want for a single probe.
+        // 0x1A: write the temperature manually, 12-bit signed in 1/16 °C.
+        //
+        // This must not be skipped. The SSD1675 has no on-die temperature
+        // sensor (datasheet pg 6 block diagram) and this badge wires no
+        // external one, so there is nothing for a LoadTemp step to sample:
+        // the register would sit at its POR value and the §6.9 TR-search
+        // would match a waveform that does not drive the panel. An earlier
+        // version of this probe used LoadTemp and no 0x1A write, and the
+        // resulting LUT measured 1010 waveform frames against the 1345 the
+        // panel's OTP actually holds -- every refresh then ran forever with
+        // BUSY never falling.
+        let byte1 = ((temp_raw >> 4) & 0xFF) as u8;
+        let byte2 = ((temp_raw & 0x0F) << 4) as u8;
+        dc_out.set_low();
+        spi_tx.write(&[0x1A]).await.ok();
+        dc_out.set_high();
+        spi_tx.write(&[byte1, byte2]).await.ok();
+        // 0x22 / 0x91: EnableClock | LoadLUT-OTP-Mode1 | DisableClock.
+        // Deliberately NOT 0xB1: the LoadTemp bit would re-sample the
+        // absent sensor and clobber the value just written.
         dc_out.set_low();
         spi_tx.write(&[0x22]).await.ok();
         dc_out.set_high();
-        spi_tx.write(&[0xB1]).await.ok();
+        spi_tx.write(&[0x91]).await.ok();
         // 0x20: Master Activation — BUSY goes HIGH while the controller loads
         // the OTP zone.
         dc_out.set_low();
@@ -334,6 +377,10 @@ async fn probe_lut(
 pub struct Panel {
     gfx: EpdGfx,
     variant: DisplayVariant,
+    /// Permanently-zero red plane, in RAM so EasyDMA can read it.
+    red_zeros: &'static [u8; BUF_SIZE],
+    /// Host-side shadow + dirty tracking for the partial-refresh engine.
+    partial: &'static mut PartialState,
     /// Waveform frames in the fast (inversion-stripped) LUT. Zero means it
     /// drives nothing and `show` must use the full waveform instead.
     fast_frames: u32,
@@ -370,7 +417,7 @@ impl Panel {
         // table, at 2-3 s of boot cost; a room-temperature video player does
         // not need that, so the one probed image is replicated into every
         // band and `Display::band_idx()` becomes a no-op selector.
-        let otp = probe_lut(&sck, &mosi, &cs, &dc, &rst, &busy).await;
+        let otp = probe_lut(&sck, &mosi, &cs, &dc, &rst, &busy, ROOM_TEMP_RAW).await;
         for band in lut_table.iter_mut() {
             *band = otp;
         }
@@ -379,13 +426,12 @@ impl Panel {
         // LUT row/timing layout, which `patch_no_invert` and the driver's
         // scaling both depend on.
         let variant = detect_variant_from_otp(&otp);
-        defmt::info!(
-            "EPD controller: {}",
-            match variant {
-                DisplayVariant::Ssd1675B => "SSD1675B (10-byte row LUT)",
-                DisplayVariant::Ssd1675 => "SSD1675 (7-byte row LUT)",
-            }
-        );
+        let variant_name = match variant {
+            DisplayVariant::Ssd1675B => "SSD1675B (10-byte row LUT)",
+            DisplayVariant::Ssd1675 => "SSD1675 (7-byte row LUT)",
+        };
+        defmt::info!("EPD controller: {}", variant_name);
+        crate::log!("EPD controller: {}", variant_name);
 
         // Derive the flicker-free table: same waveform with the inversion /
         // pre-charge phases zeroed.  Replicated into every band for the same
@@ -440,6 +486,7 @@ impl Panel {
         // registered on B for the VGH bootstrap — hence this ordering.
         if gfx.reset().await.is_err() {
             defmt::error!("EPD reset/init failed");
+            crate::log!("EPD reset/init failed");
         }
 
         // How much drive the fast waveform actually has.
@@ -457,13 +504,31 @@ impl Panel {
             fast_frames,
             full_frames
         );
+        crate::log!(
+            "EPD waveform frames: fast {}, full {}",
+            fast_frames,
+            full_frames
+        );
         if fast_frames == 0 {
             defmt::warn!("fast waveform is empty; falling back to the full waveform");
+            crate::log!("fast waveform is empty; falling back to the full waveform");
         }
 
         Panel {
             gfx,
             variant,
+            red_zeros: RED_ZEROS_CELL.init([0u8; BUF_SIZE]),
+            partial: {
+                let state = PARTIAL_CELL.init(PartialState::take(ROWS, COLS as u16));
+                // Never promote to a full refresh. The stock firmware does so
+                // every few screens to clear ghosting, but here the ghosting
+                // is wanted and a full waveform costs ~12 s -- fifty frames.
+                state.set_config(PartialConfig {
+                    full_after_screens: u32::MAX,
+                    ..PartialConfig::default()
+                });
+                state
+            },
             fast_frames,
         }
     }
@@ -477,6 +542,12 @@ impl Panel {
     /// nothing to skip while costing ~46 KB of `.bss`.  `update_bw` picks
     /// the `select_no_invert()` waveform — the flicker-free one.
     pub async fn show(&mut self, black: &[u8; BUF_SIZE], speed: u8) {
+        // No per-frame reset. It was added while chasing what turned out to
+        // be the DMA panic, and it is actively harmful: `reset()` waits for
+        // BUSY to fall, so on a panel still busy from the previous frame it
+        // eats the entire refresh budget before any pixels are driven.
+        // `update_bw` re-pushes the LUT and the RAM pointers itself.
+
         // When the fast waveform is empty it cannot draw anything, so use the
         // full one. It flashes and is far slower, but a slow visible video
         // beats a fast invisible one.
@@ -484,17 +555,34 @@ impl Panel {
             self.gfx.black_buffer_mut().copy_from_slice(black);
             if self.gfx.update_tc(speed).await.is_err() {
                 defmt::error!("EPD full-waveform frame refresh failed");
+                crate::log!("EPD full-waveform frame refresh failed");
             }
             return;
         }
 
+        let t0 = embassy_time::Instant::now();
+
+        // Drive through the partial-refresh engine, the same path the badge
+        // firmware uses. It diffs against a host-side shadow and drives only
+        // the pixels that changed, with the inversion phases patched out, so
+        // there is no flash and no full-screen erase -- the ghosting just
+        // accumulates, which for this is the point.
+        self.gfx.black_buffer_mut().copy_from_slice(black);
+        self.gfx.red_buffer_mut().copy_from_slice(self.red_zeros);
+        sync_from_planes(self.partial, black, self.red_zeros);
+
         let display: &mut Display<'static, _> = &mut self.gfx;
-        if display
-            .update_bw(black, &RED_ZEROS, UpdateMode::Mode1, speed)
-            .await
-            .is_err()
-        {
-            defmt::error!("EPD frame refresh failed");
+        match display.update_partial(self.partial, speed).await {
+            Ok(kind) => defmt::info!(
+                "partial {} ms, kind {}, busy {}",
+                t0.elapsed().as_millis(),
+                defmt::Debug2Format(&kind),
+                busy_level() as u8
+            ),
+            Err(_) => {
+                defmt::error!("EPD partial refresh failed");
+                crate::log!("EPD partial refresh failed");
+            }
         }
     }
 
@@ -505,12 +593,14 @@ impl Panel {
         self.gfx.clear(Color::White);
         if self.gfx.reset().await.is_err() {
             defmt::error!("EPD reset before clear failed");
+            crate::log!("EPD reset before clear failed");
         }
         // OEM timing (the variant default) — a full refresh is a one-off at
         // start/end, so there is nothing to gain by rushing it.
         let speed = self.variant.default_lut_speed();
         if self.gfx.update_tc(speed).await.is_err() {
             defmt::error!("EPD clear-to-white failed");
+            crate::log!("EPD clear-to-white failed");
         }
     }
 
