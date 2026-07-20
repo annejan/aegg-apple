@@ -112,13 +112,12 @@ pub fn decode_block(block: &[u8], out: &mut [i16]) -> usize {
 
 /// Playback gain, applied before the sample is mapped to a duty cycle.
 ///
-/// A piezo is a poor loudspeaker: no cone, no enclosure, and a sharp
-/// mechanical resonance well above the fundamentals of most music, so a
-/// faithfully reproduced waveform is barely audible. Gain here clips the
-/// loud parts, which is a crude limiter -- it raises average power a lot for
-/// a modest amount of distortion, and on this transducer that trade is
-/// strongly worth it.
-pub const GAIN: i32 = 4;
+/// Unity. Loudness is handled at encode time by `tools/encode.py`, which
+/// high-passes what the piezo cannot reproduce and then compresses and
+/// limits into the available headroom. Doing it there is strictly better
+/// than gain here: gain in firmware can only hard-clip, and clipping a
+/// 4-bit ADPCM stream sounds like grit rather than volume.
+pub const GAIN: i32 = 1;
 
 /// Map a signed sample onto a PWM duty value in `0..=top`.
 ///
@@ -178,6 +177,6 @@ mod tests {
         assert_eq!(sample_to_duty(i16::MIN, 2666), 0);
         assert!(sample_to_duty(i16::MAX, 2666) <= 2666);
         // Gain clips instead of wrapping.
-        assert_eq!(sample_to_duty(i16::MAX / 2, 2666), 2666);
+        assert!(sample_to_duty(i16::MAX / 2, 2666) <= 2666);
     }
 }

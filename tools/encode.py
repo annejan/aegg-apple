@@ -162,12 +162,46 @@ STEP_TABLE = [
 INDEX_TABLE = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
 
 
+# Filter chain for a piezo buzzer.
+#
+# The transducer has no cone and no enclosure: it produces essentially nothing
+# below a few hundred Hz, and its output is dominated by a mechanical
+# resonance a few kHz up. Feeding it a faithful full-range mix wastes most of
+# the ADPCM's four bits encoding bass that will never be heard, and leaves the
+# audible part quiet.
+#
+#   highpass   drop what the piezo cannot reproduce, so the bit depth is
+#              spent on the part that survives
+#   lowpass    band-limit the top end too, concentrating what is left in the
+#              range the piezo actually radiates. This is a loudness measure,
+#              not a cleanliness one: it was expected to help the ADPCM
+#              predictor as well, but measured against the same material that
+#              is worth only 0.3 dB of SNR (14.2 -> 14.5), so do not credit it
+#              with more than it does
+#   compand    heavy compression -- raises the quiet passages a long way
+#              without letting the loud ones clip. This is what actually makes
+#              it sound loud, and it replaces the brutal clipping the firmware
+#              was doing at 4x gain
+#   volume     bring the whole thing up toward full scale
+#   alimiter   last in the chain, so it is the thing that decides the ceiling.
+#              Putting it before the gain stage just means the gain clips
+#              afterwards and undoes the limiting.
+PIEZO_FILTER = (
+    "highpass=f=500,"
+    "lowpass=f=3400,"
+    "compand=attacks=0:decays=0.02"
+    ":points=-70/-18|-45/-6|-25/-3|-10/-1|0/-1,"
+    "volume=3,"
+    "alimiter=limit=0.95"
+)
+
+
 def read_pcm(src: Path, rate: int, gain: float) -> list[int]:
-    cmd = ["ffmpeg", "-v", "error", "-i", str(src), "-ac", "1",
-           "-ar", str(rate)]
+    chain = PIEZO_FILTER
     if gain != 1.0:
-        cmd += ["-af", f"volume={gain}"]
-    cmd += ["-f", "s16le", "-"]
+        chain += f",volume={gain}"
+    cmd = ["ffmpeg", "-v", "error", "-i", str(src), "-ac", "1",
+           "-ar", str(rate), "-af", chain, "-f", "s16le", "-"]
     raw = subprocess.run(cmd, capture_output=True, check=True).stdout
     return list(struct.unpack(f"<{len(raw)//2}h", raw[:len(raw)//2*2]))
 

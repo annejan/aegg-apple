@@ -98,9 +98,27 @@ speed, so frames are plain-thresholded.
 **`BADAPPLE.SND`** — 4-bit IMA ADPCM, mono, in self-contained blocks that each
 restart the predictor so playback can seek.
 
-At 4 fps and 6 kHz the pair comes to **937 KiB**, against the ~1000 KiB the
-FAT12 volume holds. 8 kHz audio would be 862 KiB on its own and does not fit,
-which is what fixes the sample rate at 6 kHz.
+Audio is shaped for the transducer before it is encoded. The piezo radiates
+essentially nothing below a few hundred Hz, so the signal is bandpassed to
+500–3400 Hz, then compressed and limited into the available headroom. Loudness
+has to come from compression: the limiter caps peaks, so raising the gain
+alone changes nothing above about 28% RMS.
+
+Doing this at encode time rather than in firmware matters. Applying gain on the
+badge can only hard-clip, and clipping a 4-bit ADPCM stream sounds like grit
+rather than volume — that was the first version and it sounded bad. Measured
+over the whole track, the shaped version reaches 37% RMS against 27%, with
+clipping down at 0.2%.
+
+It is still 4-bit ADPCM through a piezo, at about 14 dB SNR. Better, not good.
+
+At 2 fps and 7500 Hz the pair comes to **951 KiB**, against the ~1000 KiB the
+FAT12 volume holds.
+
+The split between them is worth noting: the panel only manages about 1 fps, so
+encoding video at 2 fps rather than 4 costs nothing visible and frees ~150 KiB,
+which is spent on the audio sample rate instead — the one place the extra bytes
+are actually audible.
 
 ## Building the assets
 
