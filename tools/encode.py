@@ -246,8 +246,14 @@ def main() -> None:
     print(f"{snd}  {len(samples)} samples @ {args.rate}Hz  "
           f"{snd.stat().st_size/1024:.1f} KiB")
 
+    # The badge's FAT12 volume is the second MiB of the 2 MiB QSPI part; the
+    # first MiB belongs to the ekv key-value store and is left alone.
     total = vid.stat().st_size + snd.stat().st_size
-    print(f"total {total/1024:.1f} KiB of 2048 KiB QSPI")
+    budget = 1000 * 1024
+    print(f"total {total/1024:.1f} KiB of ~1000 KiB usable"
+          f"  ({100*total/budget:.0f}%)")
+    if total > budget:
+        sys.exit("assets do not fit the FAT12 volume")
 
 
 if __name__ == "__main__":

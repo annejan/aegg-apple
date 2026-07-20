@@ -27,9 +27,9 @@ These set every design decision, so they're worth stating up front:
 - **There is no DAC.** Audio is a piezo buzzer on P0_13 driven by PWM0.
   Sample playback means duty-modulating it from EasyDMA; the piezo's
   resonance, not the bit depth, is what limits how it sounds.
-- **QSPI is 2 MiB.** The stock firmware splits it into a 1 MiB `ekv` key-value
-  store plus a 1 MiB FAT12 partition. This firmware has no pet game and no
-  settings to persist, so FAT12 gets the whole 2 MiB.
+- **The asset budget is ~1000 KiB.** QSPI is 2 MiB, split into a 1 MiB `ekv`
+  key-value store and the 1 MiB FAT12 partition exposed over USB. Only the
+  FAT12 half is used; `ekv` is left alone so a stock badge stays recoverable.
 
 ## Asset format
 
@@ -57,7 +57,9 @@ speed, so frames are plain-thresholded.
 **`BADAPPLE.SND`** — 4-bit IMA ADPCM, mono, in self-contained blocks that each
 restart the predictor so playback can seek.
 
-At 4 fps and 8 kHz the pair comes to **1152 KiB of the 2048 KiB** available.
+At 4 fps and 6 kHz the pair comes to **937 KiB**, against the ~1000 KiB the
+FAT12 volume holds. 8 kHz audio would be 862 KiB on its own and does not fit,
+which is what fixes the sample rate at 6 kHz.
 
 ## Building the assets
 
@@ -66,7 +68,7 @@ The video is not committed. Fetch and encode:
 ```sh
 yt-dlp -f 'bv*[height<=480]+ba/b[height<=480]' -o assets/badapple.%\(ext\)s \
   'https://www.youtube.com/watch?v=FtutLA63Cp8'
-python3 tools/encode.py assets/badapple.webm --fps 4 --rate 8000
+python3 tools/encode.py assets/badapple.webm --fps 4 --rate 6000
 ```
 
 Outputs land in `assets/to-badge/`, to be copied onto the badge's USB volume.
