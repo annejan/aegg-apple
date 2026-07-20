@@ -3,6 +3,7 @@
 /assets/*.webm
 /assets/*.mp4
 /assets/frames/
+/assets/to-badge/
 *.bin
 *.uf2
 .DS_Store
